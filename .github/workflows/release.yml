@@ -1,0 +1,97 @@
+name: Rust Release
+
+permissions:
+  contents: write
+  security-events: write
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  trivy-scan:
+    name: Trivy Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy - Table
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+          ignore-unfixed: true
+          scanners: "vuln,secret"
+
+      - name: Run Trivy - SARIF
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+          ignore-unfixed: true
+          scanners: "vuln,secret"
+
+      - name: Upload hasil scan ke GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  build-release:
+    name: Build Release on ${{ matrix.os }}
+    needs: trivy-scan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: openfortivpn-tui
+            archive_name: openfortivpn-tui-linux.zip
+            checksum_name: openfortivpn-tui-linux-sha256.txt
+          - os: macos-latest
+            artifact_name: openfortivpn-tui
+            archive_name: openfortivpn-tui-macos.zip
+            checksum_name: openfortivpn-tui-macos-sha256.txt
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          mkdir -p package
+          cp "target/release/${{ matrix.artifact_name }}" package/
+          cd package
+          zip "../${{ matrix.archive_name }}" "${{ matrix.artifact_name }}"
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          shasum -a 256 "${{ matrix.archive_name }}" > "${{ matrix.checksum_name }}"
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.archive_name }}
+            ${{ matrix.checksum_name }}

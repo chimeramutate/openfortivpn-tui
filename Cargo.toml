@@ -1,0 +1,21 @@
+[package]
+name = "openfortivpn-tui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "openfortivpn-tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30.0"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+libc = "0.2"
