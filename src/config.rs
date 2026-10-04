@@ -19,6 +19,28 @@ pub struct VpnProfile {
     pub use_sudo_password: bool,
     #[serde(default)]
     pub sudo_password: String,
+    #[serde(default = "default_set_routes")]
+    pub set_routes: bool,
+    #[serde(default = "default_set_dns")]
+    pub set_dns: bool,
+    #[serde(default = "default_pppd_use_peerdns")]
+    pub pppd_use_peerdns: bool,
+    #[serde(default)]
+    pub half_internet_routes: bool,
+    #[serde(default)]
+    pub route_whitelist: String,
+}
+
+fn default_set_routes() -> bool {
+    true
+}
+
+fn default_set_dns() -> bool {
+    true
+}
+
+fn default_pppd_use_peerdns() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -88,5 +110,22 @@ impl Config {
         if self.selected_profile.as_deref() == Some(name) {
             self.selected_profile = None;
         }
+    }
+}
+
+impl VpnProfile {
+    pub fn auto_route_count(&self) -> usize {
+        self.route_whitelist
+            .split([',', '\n'])
+            .filter(|entry| !entry.trim().is_empty())
+            .count()
+    }
+
+    pub fn uses_legacy_network_fallback(&self) -> bool {
+        !self.set_routes
+            && !self.set_dns
+            && !self.pppd_use_peerdns
+            && !self.half_internet_routes
+            && self.route_whitelist.trim().is_empty()
     }
 }

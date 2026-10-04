@@ -9,11 +9,15 @@ Repository: [openfortivpn-tui GitHub Repository](https://github.com/Asepimam/ope
 ## Features
 
 * Simple terminal-based interface
-* Multiple concurrent VPN sessions
+* Multiple concurrent VPN sessions, each on its own `pppN` interface (first session `ppp0`, next `ppp1`, ...; forced via `--pppd-ifname` on Linux, auto-assigned by the kernel on macOS)
+* Mouse support: click profiles, session tabs, buttons, form fields and toggles
+* Network loss handling: tunnels are stopped when WiFi/LAN drops and reconnected when it returns
 * Isolated session state management
 * OTP / 2FA support
 * Debug logging support
 * Profile management
+* Per-profile route and DNS controls for mixed VPN environments
+* Post-connect route/DNS diagnostics
 * Automatic process cleanup
 * Lightweight and fast Rust application
 
@@ -120,8 +124,22 @@ Debug mode is useful for:
 * VPN connection troubleshooting
 * OTP / authentication debugging
 * Inspecting raw `openfortivpn` output
+* Inspecting route/DNS diagnostics after a tunnel is up
 
 Sensitive OTP tokens are never written to the UI or debug log.
+
+---
+
+# Route and DNS Controls
+
+Each profile can control how `openfortivpn` configures routes and DNS:
+
+* Atur route otomatis -> `--set-routes=1|0`
+* Atur DNS otomatis -> `--set-dns=1|0`
+* Pakai peer DNS pppd -> `--pppd-use-peerdns=1|0`
+* Half internet routes -> `--half-internet-routes=1|0`
+
+These options are useful on macOS when FortiClient, ZTNA, or another VPN is already active. If a tunnel says connected but internal traffic does not work, try disabling automatic route/DNS updates for the affected profile and add only the routes you need outside the app.
 
 ---
 

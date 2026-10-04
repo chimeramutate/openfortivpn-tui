@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    app::{App, AppEvent, Focus, NotifLevel, PendingAction, UiMode, VpnState, profile_form},
+    app::{App, AppEvent, Click, Focus, NotifLevel, PendingAction, UiMode, VpnState, profile_form},
     config::{self, Config},
     vpn,
 };
@@ -115,11 +115,16 @@ pub async fn handle_profile_form_mode(app: &mut App, key: KeyEvent) -> Result<()
             Focus::Password => app.focus = Focus::SudoPassword,
             Focus::SudoPassword => app.focus = Focus::SavePassword,
             Focus::SavePassword => app.focus = Focus::UseSudoPassword,
-            Focus::UseSudoPassword => app.focus = Focus::ProfileName,
+            Focus::UseSudoPassword => app.focus = Focus::SetRoutes,
+            Focus::SetRoutes => app.focus = Focus::SetDns,
+            Focus::SetDns => app.focus = Focus::PppdUsePeerDns,
+            Focus::PppdUsePeerDns => app.focus = Focus::HalfInternetRoutes,
+            Focus::HalfInternetRoutes => app.focus = Focus::RouteWhitelist,
+            Focus::RouteWhitelist => app.focus = Focus::ProfileName,
             _ => app.focus = Focus::ProfileName,
         },
         KeyCode::BackTab => match app.focus {
-            Focus::ProfileName => app.focus = Focus::UseSudoPassword,
+            Focus::ProfileName => app.focus = Focus::RouteWhitelist,
             Focus::Host => app.focus = Focus::ProfileName,
             Focus::Port => app.focus = Focus::Host,
             Focus::Username => app.focus = Focus::Port,
@@ -127,19 +132,29 @@ pub async fn handle_profile_form_mode(app: &mut App, key: KeyEvent) -> Result<()
             Focus::SudoPassword => app.focus = Focus::Password,
             Focus::SavePassword => app.focus = Focus::SudoPassword,
             Focus::UseSudoPassword => app.focus = Focus::SavePassword,
+            Focus::SetRoutes => app.focus = Focus::UseSudoPassword,
+            Focus::SetDns => app.focus = Focus::SetRoutes,
+            Focus::PppdUsePeerDns => app.focus = Focus::SetDns,
+            Focus::HalfInternetRoutes => app.focus = Focus::PppdUsePeerDns,
+            Focus::RouteWhitelist => app.focus = Focus::HalfInternetRoutes,
             _ => app.focus = Focus::ProfileName,
         },
-        KeyCode::Char(' ') => {
+        KeyCode::Char(' ') if is_toggle_field(&app.focus) => {
             if app.focus == Focus::SavePassword {
                 app.profile_save_password = !app.profile_save_password;
-                if !app.profile_save_password {
-                    app.profile_password.clear();
-                }
             } else if app.focus == Focus::UseSudoPassword {
                 app.profile_use_sudo_password = !app.profile_use_sudo_password;
                 if !app.profile_use_sudo_password {
                     app.profile_sudo_password.clear();
                 }
+            } else if app.focus == Focus::SetRoutes {
+                app.profile_set_routes = !app.profile_set_routes;
+            } else if app.focus == Focus::SetDns {
+                app.profile_set_dns = !app.profile_set_dns;
+            } else if app.focus == Focus::PppdUsePeerDns {
+                app.profile_pppd_use_peerdns = !app.profile_pppd_use_peerdns;
+            } else if app.focus == Focus::HalfInternetRoutes {
+                app.profile_half_internet_routes = !app.profile_half_internet_routes;
             }
         }
         KeyCode::Enter => save_profile(app).await?,
@@ -156,6 +171,7 @@ pub async fn handle_profile_form_mode(app: &mut App, key: KeyEvent) -> Result<()
             Focus::Username => handle_text_input(&mut app.profile_username, key),
             Focus::Password => handle_text_input(&mut app.profile_password, key),
             Focus::SudoPassword => handle_text_input(&mut app.profile_sudo_password, key),
+            Focus::RouteWhitelist => handle_text_input(&mut app.profile_route_whitelist, key),
             _ => {}
         },
     }
@@ -196,7 +212,7 @@ pub async fn handle_connect_mode(app: &mut App, key: KeyEvent) -> Result<()> {
             app.cycle_focus_forward();
             return Ok(());
         }
-        (KeyModifiers::SHIFT, KeyCode::BackTab) => {
+        (_, KeyCode::BackTab) => {
             app.cycle_focus_backward();
             return Ok(());
         }
@@ -362,63 +378,18 @@ async fn accept_cert_and_reconnect(app: &mut App) -> Result<()> {
     let Some(session) = app.active_session_mut() else {
         return Ok(());
     };
-    let cert = match session.pending_cert.take() {
-        Some(c) => c,
-        None => return Ok(()),
+    let Some(cert) = session.pending_cert.take() else {
+        return Ok(());
     };
     let profile_name = session.profile_name.clone();
     session.push_log(format!("[CERT] Certificate diterima: {}", cert.subject_cn));
     session.trusted_cert = Some(cert.hash.clone());
-    session.reset_connection_metrics();
-    session.vpn_state = VpnState::Connecting;
-    let session_id = session.id;
-    let host = session.host.clone();
-    let port = session.port;
-    let username = session.username.clone();
-    let password = session.password.clone();
-    let sudo_pwd = if session.sudo_password.is_empty() {
-        None
-    } else {
-        Some(session.sudo_password.clone())
-    };
-    let pid_store = session.vpn_pid.clone();
-    let stdin_store = session.vpn_stdin.clone();
-    let input_flag = session.waiting_for_input_flag.clone();
+    session.vpn_state = VpnState::Disconnected;
 
     app.update_profile_trusted_cert(&profile_name, &cert.hash);
     save_all_config(app).ok();
-    app.focus = Focus::Disconnect;
     app.push_log("[APP] Menghubungkan ulang dengan cert trusted...");
-
-    let trusted_cert = Some(cert.hash);
-    let event_tx = app.event_tx.clone();
-    tokio::spawn(async move {
-        if let Err(e) = vpn::connect(
-            session_id,
-            &host,
-            port,
-            &username,
-            &password,
-            sudo_pwd,
-            trusted_cert,
-            event_tx.clone(),
-            pid_store,
-            stdin_store,
-            input_flag,
-        )
-        .await
-        {
-            let _ = event_tx.send(AppEvent::LogLine {
-                session_id,
-                line: format!("[APP] Gagal connect ulang: {}", e),
-            });
-            let _ = event_tx.send(AppEvent::StateChanged {
-                session_id,
-                state: VpnState::Error(e.to_string()),
-            });
-        }
-    });
-    Ok(())
+    do_connect(app).await
 }
 
 fn deny_cert(app: &mut App) {
@@ -437,6 +408,18 @@ fn deny_cert(app: &mut App) {
         "Certificate ditolak. Koneksi dibatalkan.",
         NotifLevel::Warning,
     );
+}
+
+fn is_toggle_field(focus: &Focus) -> bool {
+    matches!(
+        focus,
+        Focus::SavePassword
+            | Focus::UseSudoPassword
+            | Focus::SetRoutes
+            | Focus::SetDns
+            | Focus::PppdUsePeerDns
+            | Focus::HalfInternetRoutes
+    )
 }
 
 fn handle_text_input(field: &mut String, key: KeyEvent) {
@@ -474,14 +457,24 @@ async fn do_connect(app: &mut App) -> Result<()> {
         );
         return Ok(());
     }
-    if session.host.is_empty() || session.username.is_empty() || session.password.is_empty() {
+    if !app.network_online {
         app.notify(
-            "Host, Username, dan Password harus diisi",
+            "Tidak ada koneksi jaringan (WiFi/LAN mati)",
             NotifLevel::Error,
         );
         return Ok(());
     }
-
+    if session.host.is_empty() || session.username.is_empty() {
+        app.notify("Host dan Username harus diisi", NotifLevel::Error);
+        return Ok(());
+    }
+    if session.password.is_empty() {
+        app.notify(
+            "Password belum diisi - edit profile (F3) lalu isi password",
+            NotifLevel::Error,
+        );
+        return Ok(());
+    }
     let session_id = session.id;
     let profile_name = session.profile_name.clone();
     let host = session.host.clone();
@@ -489,6 +482,11 @@ async fn do_connect(app: &mut App) -> Result<()> {
     let username = session.username.clone();
     let password = session.password.clone();
     let trusted_cert = session.trusted_cert.clone();
+    let set_routes = session.set_routes;
+    let set_dns = session.set_dns;
+    let pppd_use_peerdns = session.pppd_use_peerdns;
+    let half_internet_routes = session.half_internet_routes;
+    let route_whitelist = session.route_whitelist.clone();
     let sudo_pwd = if session.sudo_password.is_empty() {
         None
     } else {
@@ -498,8 +496,19 @@ async fn do_connect(app: &mut App) -> Result<()> {
     let stdin_store = session.vpn_stdin.clone();
     let input_flag = session.waiting_for_input_flag.clone();
 
+    // Reserve a pppN not used by the system or another session (ppp0, then ppp1, ...).
+    let reserved: Vec<String> = app
+        .sessions
+        .iter()
+        .filter(|s| s.id != session_id && !matches!(s.vpn_state, VpnState::Disconnected | VpnState::Error(_)))
+        .filter_map(|s| s.vpn_interface.clone())
+        .collect();
+    let ifname = vpn::pick_ppp_ifname(&reserved).await;
+
     if let Some(session) = app.active_session_mut() {
         session.reset_connection_metrics();
+        session.vpn_interface = Some(ifname.clone());
+        session.reconnect_on_network = false;
         session.vpn_state = VpnState::Connecting;
     }
     app.push_log(format!("[APP] Menghubungkan profile '{}'...", profile_name));
@@ -518,6 +527,12 @@ async fn do_connect(app: &mut App) -> Result<()> {
             &password,
             sudo_pwd,
             trusted_cert,
+            set_routes,
+            set_dns,
+            pppd_use_peerdns,
+            half_internet_routes,
+            route_whitelist,
+            ifname,
             event_tx.clone(),
             pid_store,
             stdin_store,
@@ -681,6 +696,13 @@ async fn save_profile(app: &mut App) -> Result<()> {
         app.notify("Host tidak boleh kosong!", NotifLevel::Error);
         return Ok(());
     }
+    if let Err(err) = vpn::validate_route_targets(&app.profile_route_whitelist) {
+        app.notify(
+            format!("Auto-route tidak valid: {}", err),
+            NotifLevel::Error,
+        );
+        return Ok(());
+    }
 
     let port: u16 = app.profile_port.parse().unwrap_or(443);
     let new_profile = config::VpnProfile {
@@ -689,11 +711,8 @@ async fn save_profile(app: &mut App) -> Result<()> {
         port,
         username: app.profile_username.clone(),
         save_password: app.profile_save_password,
-        password: if app.profile_save_password {
-            app.profile_password.clone()
-        } else {
-            String::new()
-        },
+        // Kept in memory for this run; Config::save drops it from disk unless save_password.
+        password: app.profile_password.clone(),
         trusted_cert: None,
         use_sudo_password: app.profile_use_sudo_password,
         sudo_password: if app.profile_use_sudo_password {
@@ -701,6 +720,11 @@ async fn save_profile(app: &mut App) -> Result<()> {
         } else {
             String::new()
         },
+        set_routes: app.profile_set_routes,
+        set_dns: app.profile_set_dns,
+        pppd_use_peerdns: app.profile_pppd_use_peerdns,
+        half_internet_routes: app.profile_half_internet_routes,
+        route_whitelist: app.profile_route_whitelist.trim().to_string(),
     };
 
     let Some(mut cfg) = load_config_or_notify(app, "Simpan profile") else {
@@ -708,11 +732,17 @@ async fn save_profile(app: &mut App) -> Result<()> {
     };
     let is_edit = app.ui_mode == UiMode::EditProfile;
     let old_name = app.editing_profile_name.clone();
+    let trusted_cert = old_name
+        .as_deref()
+        .and_then(|name| app.profiles.iter().find(|p| p.name == name))
+        .and_then(|profile| profile.trusted_cert.clone());
 
     if is_edit && let Some(old_name) = &old_name {
         cfg.delete_profile(old_name);
     }
 
+    let mut new_profile = new_profile;
+    new_profile.trusted_cert = trusted_cert;
     cfg.add_profile(new_profile);
 
     if let Err(e) = cfg.save() {
@@ -721,6 +751,14 @@ async fn save_profile(app: &mut App) -> Result<()> {
     }
 
     app.profiles = cfg.profiles;
+    if let Some(saved_profile) = app
+        .profiles
+        .iter()
+        .find(|p| p.name == app.profile_name)
+        .cloned()
+    {
+        app.sync_profile_into_sessions(old_name.as_deref(), &saved_profile);
+    }
     app.selected_profile_index = app
         .profiles
         .iter()
@@ -736,6 +774,91 @@ async fn save_profile(app: &mut App) -> Result<()> {
         NotifLevel::Success,
     );
     app.push_log(format!("[APP] Profile '{}' tersimpan", app.profile_name));
+    Ok(())
+}
+
+/// Kill tunnels that died with the machine's network and bring them back when it returns.
+pub async fn handle_network_change(app: &mut App, online: bool) -> Result<()> {
+    app.network_online = online;
+    if !online {
+        let mut dropped = 0;
+        for session in app.sessions.iter_mut() {
+            if matches!(
+                session.vpn_state,
+                VpnState::Connected | VpnState::Connecting | VpnState::WaitingToken
+            ) {
+                session.reconnect_on_network = true;
+                session.push_log("[NET] Koneksi jaringan terputus, tunnel dihentikan");
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            disconnect_all_sessions(app);
+        }
+        app.notify(
+            "Koneksi jaringan (WiFi) terputus - VPN akan reconnect otomatis",
+            NotifLevel::Error,
+        );
+        return Ok(());
+    }
+
+    app.notify("Koneksi jaringan kembali", NotifLevel::Success);
+    reconnect_dropped_sessions(app).await
+}
+
+/// Reconnect sessions flagged by a network drop once they are fully disconnected.
+pub async fn reconnect_dropped_sessions(app: &mut App) -> Result<()> {
+    if !app.network_online {
+        return Ok(());
+    }
+    let ready: Vec<usize> = app
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.reconnect_on_network
+                && matches!(s.vpn_state, VpnState::Disconnected | VpnState::Error(_))
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    for idx in ready {
+        app.sessions[idx].reconnect_on_network = false;
+        app.sessions[idx].push_log("[NET] Jaringan kembali, menghubungkan ulang...");
+        app.activate_session(idx);
+        do_connect(app).await?;
+    }
+    Ok(())
+}
+
+/// Mouse click: replay the keyboard action of whatever was drawn under the cursor.
+pub async fn handle_click(app: &mut App, x: u16, y: u16) -> Result<()> {
+    if app.connection_error.is_some() {
+        app.clear_connection_error();
+        return Ok(());
+    }
+    if app.ui_mode == UiMode::Help {
+        app.hide_help();
+        return Ok(());
+    }
+    let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    match app.click_at(x, y) {
+        Some(Click::Profile(idx)) if idx == app.selected_profile_index => {
+            crate::runtime::handle_key(app, press(KeyCode::Enter)).await?
+        }
+        Some(Click::Profile(idx)) => {
+            app.delete_confirmation = None;
+            app.select_profile(idx);
+        }
+        Some(Click::SessionTab(idx)) => app.activate_session(idx),
+        Some(Click::Focus(focus, key)) => {
+            app.focus = focus;
+            if let Some(code) = key {
+                crate::runtime::handle_key(app, press(code)).await?;
+            }
+        }
+        Some(Click::Key(code)) => crate::runtime::handle_key(app, press(code)).await?,
+        None => {}
+    }
     Ok(())
 }
 

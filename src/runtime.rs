@@ -2,17 +2,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::DefaultTerminal;
 
 use crate::{
     actions,
     app::{App, AppEvent, Focus, NotifLevel, UiMode, VpnState},
     config::Config,
-    ui,
+    ui, vpn,
 };
 
 pub async fn run() -> Result<()> {
@@ -34,42 +36,62 @@ pub async fn run() -> Result<()> {
         app.focus = Focus::ProfileName;
     }
 
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    spawn_network_watcher(app.event_tx.clone());
+
+    // ratatui::init also installs a panic hook that restores the terminal.
+    let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableMouseCapture)?;
 
     let result = run_app(&mut terminal, &mut app).await;
 
     actions::save_all_config(&app).ok();
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    execute!(std::io::stdout(), DisableMouseCapture)?;
+    ratatui::restore();
     if let Err(e) = result {
         eprintln!("Error: {}", e);
     }
     Ok(())
 }
 
-async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: &mut App,
-) -> Result<()> {
+fn spawn_network_watcher(tx: tokio::sync::mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let mut online = true;
+        loop {
+            let now = vpn::has_physical_network();
+            if now != online {
+                online = now;
+                if tx.send(AppEvent::NetworkChanged(now)).is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
+async fn run_app(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let tick_rate = Duration::from_millis(100);
     loop {
         terminal.draw(|f| ui::render(f, app))?;
-        drain_events(app).await;
-        if event::poll(tick_rate)?
-            && let Event::Key(key) = event::read()?
-        {
-            handle_key(app, key).await?;
+        drain_events(app).await?;
+        if event::poll(tick_rate)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key).await?,
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        actions::handle_click(app, mouse.column, mouse.row).await?
+                    }
+                    MouseEventKind::ScrollUp if app.ui_mode == UiMode::ProfileList => {
+                        handle_key(app, KeyCode::Up.into()).await?
+                    }
+                    MouseEventKind::ScrollDown if app.ui_mode == UiMode::ProfileList => {
+                        handle_key(app, KeyCode::Down.into()).await?
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
         }
         app.tick_notification();
         if app.should_quit {
@@ -79,7 +101,7 @@ async fn run_app(
     Ok(())
 }
 
-async fn drain_events(app: &mut App) {
+async fn drain_events(app: &mut App) -> Result<()> {
     use tokio::sync::mpsc::error::TryRecvError;
     loop {
         match app.event_rx.try_recv() {
@@ -99,6 +121,9 @@ async fn drain_events(app: &mut App) {
                     }
                 }
                 AppEvent::DebugLog(line) => app.push_debug_log(line),
+                AppEvent::NetworkChanged(online) => {
+                    actions::handle_network_change(app, online).await?
+                }
                 AppEvent::SpeedUpdate {
                     session_id,
                     interface,
@@ -117,14 +142,39 @@ async fn drain_events(app: &mut App) {
                     session.rx_total_bytes = rx_total;
                     session.tx_total_bytes = tx_total;
                 }
+                AppEvent::InterfaceDetected {
+                    session_id,
+                    interface,
+                } => {
+                    let Some(idx) = app.find_session_index_by_id(session_id) else {
+                        continue;
+                    };
+                    app.sessions[idx].vpn_interface = Some(interface);
+                }
                 AppEvent::StateChanged {
                     session_id,
-                    state: new_state,
+                    state: mut new_state,
                 } => {
                     let Some(idx) = app.find_session_index_by_id(session_id) else {
                         continue;
                     };
                     let old = app.sessions[idx].vpn_state.clone();
+                    let dropped_by_network = matches!(
+                        old,
+                        VpnState::Connected | VpnState::Connecting | VpnState::WaitingToken
+                    ) && matches!(new_state, VpnState::Error(_) | VpnState::Disconnected)
+                        && !vpn::has_physical_network();
+                    if dropped_by_network {
+                        // Tunnel died before the watcher noticed; treat as a network drop.
+                        app.sessions[idx].reconnect_on_network = true;
+                        app.network_online = false;
+                    }
+                    if (dropped_by_network || old == VpnState::Disconnecting)
+                        && matches!(new_state, VpnState::Error(_))
+                    {
+                        // Non-zero exit after we killed it (or the network vanished) is not a failure.
+                        new_state = VpnState::Disconnected;
+                    }
                     app.sessions[idx].vpn_state = new_state.clone();
                     let is_active = app.active_session_index == Some(idx);
                     match (&old, &new_state) {
@@ -145,8 +195,8 @@ async fn drain_events(app: &mut App) {
                             *app.sessions[idx].waiting_for_input_flag.lock().unwrap() = false;
                         }
                         (_, VpnState::Disconnected) => {
-                            let failed_before_connected =
-                                matches!(old, VpnState::Connecting | VpnState::WaitingToken)
+                            let failed_before_connected = !dropped_by_network
+                                && matches!(old, VpnState::Connecting | VpnState::WaitingToken)
                                     && app.sessions[idx].connected_at.is_none();
                             app.sessions[idx].connected_at = None;
                             app.sessions[idx].rx_speed_bps = 0;
@@ -172,6 +222,7 @@ async fn drain_events(app: &mut App) {
                                 app.focus = Focus::Connect;
                             }
                             *app.sessions[idx].waiting_for_input_flag.lock().unwrap() = false;
+                            actions::reconnect_dropped_sessions(app).await?;
                         }
                         (_, VpnState::Error(e)) => {
                             let profile_name = app.sessions[idx].profile_name.clone();
@@ -190,6 +241,12 @@ async fn drain_events(app: &mut App) {
                             *app.sessions[idx].waiting_for_input_flag.lock().unwrap() = false;
                         }
                         _ => {}
+                    }
+                    if dropped_by_network {
+                        app.notify(
+                            "Koneksi jaringan (WiFi) terputus - VPN akan reconnect otomatis",
+                            NotifLevel::Error,
+                        );
                     }
                 }
                 AppEvent::NeedToken(session_id) => {
@@ -232,9 +289,10 @@ async fn drain_events(app: &mut App) {
             Err(TryRecvError::Disconnected) => break,
         }
     }
+    Ok(())
 }
 
-async fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
+pub async fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
     if app.connection_error.is_some() {
         if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
             app.clear_connection_error();

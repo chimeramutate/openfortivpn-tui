@@ -1,12 +1,13 @@
-use crate::app::{App, Focus, NotifLevel, PendingAction, UiMode, VpnState};
+use crate::app::{App, Click, Focus, NotifLevel, PendingAction, UiMode, VpnState};
 use ratatui::{
     Frame,
+    crossterm::event::KeyCode,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph},
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // --- Palette -----------------------------------------------------------------
 const C_BG: Color = Color::Rgb(18, 18, 28);
@@ -20,9 +21,25 @@ const C_RED: Color = Color::Rgb(255, 80, 80);
 const C_YELLOW: Color = Color::Rgb(255, 210, 60);
 const C_ORANGE: Color = Color::Rgb(255, 140, 40);
 const C_CYAN: Color = Color::Rgb(60, 210, 210);
+
+/// Text cursor that blinks every 500ms (the app redraws every ~100ms).
+fn cursor_span(color: Color) -> Span<'static> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let on = (millis / 500).is_multiple_of(2);
+    Span::styled(if on { "█" } else { " " }, Style::default().fg(color))
+}
+
+/// Fixed-size popup centered in `area`, shrunk to fit small terminals.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    area.centered(Constraint::Length(width), Constraint::Length(height))
+}
 // --- Main render entry --------------------------------------------------------
 pub fn render(f: &mut Frame, app: &App) {
     let full = f.area();
+    app.click_zones.borrow_mut().clear();
     f.render_widget(Block::default().style(Style::default().bg(C_BG)), full);
 
     let outer = Layout::default()
@@ -38,7 +55,10 @@ pub fn render(f: &mut Frame, app: &App) {
     render_body(f, app, outer[1]);
     render_statusbar(f, app, outer[2]);
 
-    // Modal popups (di atas semua layer)
+    // Modal popups (di atas semua layer): only the popup stays clickable.
+    if app.has_modal() {
+        app.click_zones.borrow_mut().clear();
+    }
     if app.ui_mode == UiMode::Help {
         render_help_popup(f, app, full);
     }
@@ -72,16 +92,7 @@ fn render_action_confirm_popup(f: &mut Frame, app: &App, area: Rect) {
     let Some(action) = app.pending_action.as_ref() else {
         return;
     };
-    let popup_w = 60u16;
-    let popup_h = 9u16;
-    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
-    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
-    let popup_area = Rect {
-        x: popup_x,
-        y: popup_y,
-        width: popup_w,
-        height: popup_h,
-    };
+    let popup_area = centered(area, 60, 9);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -140,6 +151,14 @@ fn render_action_confirm_popup(f: &mut Frame, app: &App, area: Rect) {
 
     let yes_focused = app.focus == Focus::ActionConfirmAccept;
     let no_focused = app.focus == Focus::ActionConfirmDeny;
+    app.add_click(
+        btn_rows[0],
+        Click::Focus(Focus::ActionConfirmAccept, Some(KeyCode::Enter)),
+    );
+    app.add_click(
+        btn_rows[1],
+        Click::Focus(Focus::ActionConfirmDeny, Some(KeyCode::Enter)),
+    );
 
     let yes_block = Block::default()
         .borders(Borders::ALL)
@@ -232,6 +251,10 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
                 .fg(state_color)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            if app.network_online { "" } else { "   |   NO NETWORK" },
+            Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
+        ),
     ]);
 
     let block = Block::default()
@@ -315,6 +338,7 @@ fn render_session_tabs(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let mut spans = Vec::new();
+    let mut x = inner.x;
     for (idx, session) in app.sessions.iter().enumerate() {
         let is_active = app.active_session_index == Some(idx);
         let style = if is_active {
@@ -325,15 +349,33 @@ fn render_session_tabs(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(C_TEXT).bg(C_BG)
         };
-        spans.push(Span::styled(
+        let iface = session
+            .vpn_interface
+            .as_deref()
+            .map(|i| format!(" [{}]", i))
+            .unwrap_or_default();
+        let tab = Span::styled(
             format!(
-                " {} {} ({}) ",
+                " {} {}{} ({}) ",
                 idx + 1,
                 session.profile_name,
+                iface,
                 session.vpn_state.label()
             ),
             style,
-        ));
+        );
+        let width = tab.width() as u16;
+        app.add_click(
+            Rect {
+                x,
+                width: width.min(inner.right().saturating_sub(x)),
+                height: 1,
+                ..inner
+            },
+            Click::SessionTab(idx),
+        );
+        x = x.saturating_add(width + 1);
+        spans.push(tab);
         spans.push(Span::styled(" ", Style::default()));
     }
 
@@ -342,16 +384,7 @@ fn render_session_tabs(f: &mut Frame, app: &App, area: Rect) {
 
 // --- Help Popup --------------------------------------------------------------
 fn render_help_popup(f: &mut Frame, _app: &App, area: Rect) {
-    let popup_w = 72u16;
-    let popup_h = 28u16;
-    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-    let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-    let popup_area = Rect {
-        x: popup_x,
-        y: popup_y,
-        width: popup_w,
-        height: popup_h,
-    };
+    let popup_area = centered(area, 72, 28);
 
     f.render_widget(Clear, popup_area);
 
@@ -379,7 +412,7 @@ fn render_help_popup(f: &mut Frame, _app: &App, area: Rect) {
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(7),
+            Constraint::Length(4),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(6),
@@ -409,6 +442,7 @@ fn render_help_popup(f: &mut Frame, _app: &App, area: Rect) {
         ("F1", "Buka help ini"),
         ("ESC / Ctrl+B", "Kembali ke daftar profile / Tutup help"),
         ("Ctrl+Q / Ctrl+C", "Keluar aplikasi"),
+        ("Mouse klik", "Pilih/klik profile, tab, tombol, field"),
     ];
 
     let global_text: Vec<Line> = global_shortcuts
@@ -545,12 +579,19 @@ fn render_profile_list(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(C_TEXT)
             };
 
+            if (i as u16) < inner.height {
+                app.add_click(
+                    Rect {
+                        y: inner.y + i as u16,
+                        height: 1,
+                        ..inner
+                    },
+                    Click::Profile(i),
+                );
+            }
+
             let mut spans = vec![
                 Span::styled(profile.name.clone(), style),
-                Span::styled(
-                    format!(" {}:{}", profile.host, profile.port),
-                    Style::default().fg(C_DIM),
-                ),
                 Span::styled(
                     if profile.trusted_cert.is_some() {
                         " trusted"
@@ -566,8 +607,13 @@ fn render_profile_list(f: &mut Frame, app: &App, area: Rect) {
             ];
 
             if let Some(session_idx) = has_session {
+                let iface = app.sessions[session_idx]
+                    .vpn_interface
+                    .as_deref()
+                    .map(|i| format!(" {}", i))
+                    .unwrap_or_default();
                 spans.push(Span::styled(
-                    format!(" [S{}]", session_idx + 1),
+                    format!(" [S{}{}]", session_idx + 1, iface),
                     Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
                 ));
             }
@@ -602,6 +648,8 @@ fn render_profile_details(f: &mut Frame, app: &App, area: Rect) {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -698,7 +746,64 @@ fn render_profile_details(f: &mut Frame, app: &App, area: Rect) {
             rows[5],
         );
 
-        let btn_area = rows[6];
+        let auto_route_count = profile.auto_route_count();
+        let using_legacy_fallback = profile.uses_legacy_network_fallback();
+        let route_mode = if using_legacy_fallback {
+            "Routes enabled (compat)"
+        } else if profile.set_routes {
+            if profile.half_internet_routes {
+                "Routes + half internet"
+            } else {
+                "Routes enabled"
+            }
+        } else if auto_route_count > 0 {
+            "Manual + auto targets"
+        } else {
+            "Routes disabled"
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Route:    ", label_style),
+                Span::styled(
+                    route_mode,
+                    Style::default().fg(if using_legacy_fallback || profile.set_routes {
+                        C_GREEN
+                    } else {
+                        C_YELLOW
+                    }),
+                ),
+            ])),
+            rows[6],
+        );
+
+        let dns_mode = if using_legacy_fallback {
+            "DNS + peer DNS (compat)"
+        } else {
+            match (profile.set_dns, profile.pppd_use_peerdns) {
+                (true, true) => "DNS + peer DNS",
+                (true, false) => "DNS only",
+                (false, true) => "Peer DNS only",
+                (false, false) => "DNS disabled",
+            }
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("DNS:      ", label_style),
+                Span::styled(
+                    dns_mode,
+                    Style::default().fg(
+                        if using_legacy_fallback || profile.set_dns || profile.pppd_use_peerdns {
+                            C_GREEN
+                        } else {
+                            C_YELLOW
+                        },
+                    ),
+                ),
+            ])),
+            rows[7],
+        );
+
+        let btn_area = rows[8];
         let btn_rows = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -734,6 +839,9 @@ fn render_profile_details(f: &mut Frame, app: &App, area: Rect) {
             )
             .alignment(Alignment::Center);
         f.render_widget(delete_btn, btn_rows[2]);
+        app.add_click(btn_rows[0], Click::Key(KeyCode::Enter));
+        app.add_click(btn_rows[1], Click::Key(KeyCode::F(3)));
+        app.add_click(btn_rows[2], Click::Key(KeyCode::F(4)));
     }
 }
 
@@ -770,10 +878,39 @@ fn render_profile_form(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Min(0),
         ])
         .split(inner);
+
+    let fields = [
+        Focus::ProfileName,
+        Focus::Host,
+        Focus::Port,
+        Focus::Username,
+        Focus::Password,
+        Focus::SudoPassword,
+    ];
+    for (row, focus) in rows.iter().zip(fields) {
+        app.add_click(*row, Click::Focus(focus, None));
+    }
+    let toggles = [
+        Focus::SavePassword,
+        Focus::UseSudoPassword,
+        Focus::SetRoutes,
+        Focus::SetDns,
+        Focus::PppdUsePeerDns,
+        Focus::HalfInternetRoutes,
+    ];
+    for (row, focus) in rows[6..12].iter().zip(toggles) {
+        app.add_click(*row, Click::Focus(focus, Some(KeyCode::Char(' '))));
+    }
+    app.add_click(rows[12], Click::Focus(Focus::RouteWhitelist, None));
 
     render_input(
         f,
@@ -866,7 +1003,56 @@ fn render_profile_form(f: &mut Frame, app: &App, area: Rect) {
         rows[7],
     );
 
-    let btn_area = rows[8];
+    let advanced = [
+        (
+            "Atur route otomatis",
+            app.profile_set_routes,
+            matches!(app.focus, Focus::SetRoutes),
+        ),
+        (
+            "Atur DNS otomatis",
+            app.profile_set_dns,
+            matches!(app.focus, Focus::SetDns),
+        ),
+        (
+            "Pakai peer DNS pppd",
+            app.profile_pppd_use_peerdns,
+            matches!(app.focus, Focus::PppdUsePeerDns),
+        ),
+        (
+            "Half internet routes",
+            app.profile_half_internet_routes,
+            matches!(app.focus, Focus::HalfInternetRoutes),
+        ),
+    ];
+
+    for (idx, (label, enabled, focused)) in advanced.into_iter().enumerate() {
+        let style = if focused {
+            Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_DIM)
+        };
+        let value = if enabled { "Aktif" } else { "Nonaktif" };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("{}: {}", label, value),
+                style,
+            )])),
+            rows[8 + idx],
+        );
+    }
+
+    render_input(
+        f,
+        rows[12],
+        " Auto Route Targets ",
+        &app.profile_route_whitelist,
+        matches!(app.focus, Focus::RouteWhitelist),
+        false,
+        "10.50.0.0/16,172.18.38.68",
+    );
+
+    let btn_area = rows[13];
     let btn_rows = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -889,6 +1075,8 @@ fn render_profile_form(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(save_btn, btn_rows[0]);
     f.render_widget(cancel_btn, btn_rows[1]);
+    app.add_click(btn_rows[0], Click::Key(KeyCode::Enter));
+    app.add_click(btn_rows[1], Click::Key(KeyCode::Esc));
 }
 
 fn render_connection_workspace(f: &mut Frame, app: &App, area: Rect) {
@@ -1029,6 +1217,14 @@ fn render_dashboard_actions(f: &mut Frame, app: &App, connect_area: Rect, discon
     let Some(session) = app.active_session() else {
         return;
     };
+    app.add_click(
+        connect_area,
+        Click::Focus(Focus::Connect, Some(KeyCode::Enter)),
+    );
+    app.add_click(
+        disconnect_area,
+        Click::Focus(Focus::Disconnect, Some(KeyCode::Enter)),
+    );
 
     let can_connect = matches!(
         session.vpn_state,
@@ -1169,28 +1365,22 @@ fn render_input(
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
-    let display = if value.is_empty() {
-        Span::styled(placeholder, Style::default().fg(C_DIM))
-    } else if masked {
-        Span::styled("tersembunyi", Style::default().fg(C_TEXT))
-    } else {
-        Span::styled(value, Style::default().fg(C_TEXT))
-    };
-
-    let content = if focused && !value.is_empty() {
-        Line::from(vec![Span::styled(
-            if masked {
-                "tersembunyi".to_string()
-            } else {
-                value.to_string()
-            },
-            Style::default().fg(C_TEXT),
-        )])
-    } else if focused && value.is_empty() {
-        Line::from(Span::styled(placeholder, Style::default().fg(C_DIM)))
-    } else {
-        Line::from(display)
-    };
+    let mut spans = Vec::new();
+    if !value.is_empty() {
+        let shown = if masked {
+            "•".repeat(value.chars().count())
+        } else {
+            value.to_string()
+        };
+        spans.push(Span::styled(shown, Style::default().fg(C_TEXT)));
+    }
+    if focused {
+        spans.push(cursor_span(C_FOCUS));
+    }
+    if value.is_empty() {
+        spans.push(Span::styled(placeholder, Style::default().fg(C_DIM)));
+    }
+    let content = Line::from(spans);
 
     f.render_widget(Paragraph::new(content).block(block), area);
 }
@@ -1291,9 +1481,11 @@ fn render_notification(f: &mut Frame, msg: &str, level: &NotifLevel, area: Rect)
         NotifLevel::Warning => (Color::Rgb(70, 55, 10), C_YELLOW),
         NotifLevel::Error => (Color::Rgb(70, 20, 20), C_RED),
     };
-    let width = (msg.len() as u16 + 8).min(area.width - 4).max(20);
+    let width = (msg.chars().count() as u16 + 8)
+        .max(20)
+        .min(area.width.saturating_sub(4));
     let height = 3u16;
-    let x = area.x + (area.width - width) / 2;
+    let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + 1;
 
     let notif_area = Rect {
@@ -1322,16 +1514,7 @@ fn render_notification(f: &mut Frame, msg: &str, level: &NotifLevel, area: Rect)
 }
 
 fn render_connection_error_popup(f: &mut Frame, message: &str, area: Rect) {
-    let popup_w = (area.width.saturating_sub(4)).min(64).max(36);
-    let popup_h = 9u16.min(area.height.saturating_sub(2)).max(7);
-    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
-    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
-    let popup_area = Rect {
-        x: popup_x,
-        y: popup_y,
-        width: popup_w,
-        height: popup_h,
-    };
+    let popup_area = centered(area, 64, 9);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -1367,16 +1550,7 @@ fn render_connection_error_popup(f: &mut Frame, message: &str, area: Rect) {
 
 // --- Certificate Approval Popup -----------------------------------------------
 fn render_cert_popup(f: &mut Frame, app: &App, cert: &crate::app::CertInfo, area: Rect) {
-    let popup_w = (area.width as f32 * 0.72) as u16;
-    let popup_h = 18u16;
-    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-    let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-    let popup_area = Rect {
-        x: popup_x,
-        y: popup_y,
-        width: popup_w,
-        height: popup_h,
-    };
+    let popup_area = centered(area, (area.width as f32 * 0.72) as u16, 18);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -1493,6 +1667,8 @@ fn render_cert_popup(f: &mut Frame, app: &App, cert: &crate::app::CertInfo, area
 
     let accept_focused = app.focus == Focus::CertAccept;
     let deny_focused = app.focus == Focus::CertDeny;
+    app.add_click(btn_rows[0], Click::Focus(Focus::CertAccept, Some(KeyCode::Enter)));
+    app.add_click(btn_rows[1], Click::Focus(Focus::CertDeny, Some(KeyCode::Enter)));
 
     let accept_style = if accept_focused {
         Style::default()
@@ -1550,7 +1726,7 @@ fn render_cert_popup(f: &mut Frame, app: &App, cert: &crate::app::CertInfo, area
 
     let hint_area = Rect {
         x: popup_area.x + 2,
-        y: popup_area.y + popup_area.height - 1,
+        y: popup_area.bottom().saturating_sub(1),
         width: popup_area.width.saturating_sub(4),
         height: 1,
     };
@@ -1587,16 +1763,7 @@ fn render_token_popup(f: &mut Frame, app: &App, area: Rect) {
     let Some(session) = app.active_session() else {
         return;
     };
-    let popup_w = 52u16;
-    let popup_h = 11u16;
-    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
-    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
-    let popup_area = Rect {
-        x: popup_x,
-        y: popup_y,
-        width: popup_w,
-        height: popup_h,
-    };
+    let popup_area = centered(area, 52, 11);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -1636,23 +1803,22 @@ fn render_token_popup(f: &mut Frame, app: &App, area: Rect) {
         rows[0],
     );
 
-    let token_display = &session.token_input;
-    let input_content = if token_display.is_empty() {
-        Line::from(vec![
-            Span::styled("   ", Style::default()),
-            Span::styled("Ketik token di sini... ", Style::default().fg(C_DIM)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("   ", Style::default()),
-            Span::styled(
-                token_display.as_str(),
-                Style::default()
-                    .fg(Color::Rgb(255, 230, 80))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
-    };
+    let token_color = Color::Rgb(255, 230, 80);
+    let mut input_spans = vec![
+        Span::raw("   "),
+        Span::styled(
+            session.token_input.as_str(),
+            Style::default().fg(token_color).add_modifier(Modifier::BOLD),
+        ),
+        cursor_span(token_color),
+    ];
+    if session.token_input.is_empty() {
+        input_spans.push(Span::styled(
+            " Ketik token di sini...",
+            Style::default().fg(C_DIM),
+        ));
+    }
+    let input_content = Line::from(input_spans);
 
     let input_block = Block::default()
         .title(Span::styled(" OTP Token  ", Style::default().fg(C_ORANGE)))

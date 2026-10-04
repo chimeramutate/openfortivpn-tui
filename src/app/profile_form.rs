@@ -13,6 +13,11 @@ pub fn start_new(app: &mut App) {
     app.profile_sudo_password.clear();
     app.profile_save_password = false;
     app.profile_use_sudo_password = false;
+    app.profile_set_routes = true;
+    app.profile_set_dns = true;
+    app.profile_pppd_use_peerdns = true;
+    app.profile_half_internet_routes = false;
+    app.profile_route_whitelist.clear();
     app.editing_profile_name = None;
     app.focus = Focus::ProfileName;
 }
@@ -28,5 +33,10 @@ pub fn start_edit(app: &mut App, profile: &VpnProfile) {
     app.profile_sudo_password = profile.sudo_password.clone();
     app.profile_save_password = profile.save_password;
     app.profile_use_sudo_password = profile.use_sudo_password;
+    app.profile_set_routes = profile.set_routes;
+    app.profile_set_dns = profile.set_dns;
+    app.profile_pppd_use_peerdns = profile.pppd_use_peerdns;
+    app.profile_half_internet_routes = profile.half_internet_routes;
+    app.profile_route_whitelist = profile.route_whitelist.clone();
     app.focus = Focus::ProfileName;
 }

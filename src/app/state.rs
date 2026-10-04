@@ -1,4 +1,6 @@
+use ratatui::{crossterm::event::KeyCode, layout::Rect};
 use std::{
+    cell::RefCell,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -68,6 +70,11 @@ pub enum Focus {
     SudoPassword,
     SavePassword,
     UseSudoPassword,
+    SetRoutes,
+    SetDns,
+    PppdUsePeerDns,
+    HalfInternetRoutes,
+    RouteWhitelist,
 
     // Action buttons
     Connect,
@@ -101,6 +108,17 @@ impl PendingAction {
     }
 }
 
+// --- Mouse Click Targets ----------------------------------------------------
+/// Recorded during render; a click is replayed as the equivalent keyboard action.
+#[derive(Debug, Clone)]
+pub enum Click {
+    Profile(usize),
+    SessionTab(usize),
+    /// Move focus, then optionally press a key (Enter for buttons, Space for toggles).
+    Focus(Focus, Option<KeyCode>),
+    Key(KeyCode),
+}
+
 // --- Events -------------------------------------------------------------------
 #[derive(Debug)]
 pub enum AppEvent {
@@ -121,11 +139,16 @@ pub enum AppEvent {
         rx_total: u64,
         tx_total: u64,
     },
+    InterfaceDetected {
+        session_id: u64,
+        interface: String,
+    },
     NeedToken(u64),
     CertError {
         session_id: u64,
         cert: CertInfo,
     },
+    NetworkChanged(bool),
 }
 
 pub struct ConnectionSession {
@@ -142,6 +165,11 @@ pub struct ConnectionSession {
     pub log_scroll: usize,
     pub pending_cert: Option<CertInfo>,
     pub trusted_cert: Option<String>,
+    pub set_routes: bool,
+    pub set_dns: bool,
+    pub pppd_use_peerdns: bool,
+    pub half_internet_routes: bool,
+    pub route_whitelist: String,
     pub connected_at: Option<Instant>,
     pub vpn_interface: Option<String>,
     pub rx_speed_bps: u64,
@@ -151,6 +179,8 @@ pub struct ConnectionSession {
     pub vpn_pid: Arc<Mutex<Option<u32>>>,
     pub vpn_stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
     pub waiting_for_input_flag: Arc<Mutex<bool>>,
+    /// Tunnel was dropped because the machine lost its network; reconnect when it returns.
+    pub reconnect_on_network: bool,
 }
 
 impl ConnectionSession {
@@ -169,6 +199,11 @@ impl ConnectionSession {
             log_scroll: 0,
             pending_cert: None,
             trusted_cert: profile.trusted_cert.clone(),
+            set_routes: profile.set_routes,
+            set_dns: profile.set_dns,
+            pppd_use_peerdns: profile.pppd_use_peerdns,
+            half_internet_routes: profile.half_internet_routes,
+            route_whitelist: profile.route_whitelist.clone(),
             connected_at: None,
             vpn_interface: None,
             rx_speed_bps: 0,
@@ -178,15 +213,18 @@ impl ConnectionSession {
             vpn_pid: Arc::new(Mutex::new(None)),
             vpn_stdin: Arc::new(AsyncMutex::new(None)),
             waiting_for_input_flag: Arc::new(Mutex::new(false)),
+            reconnect_on_network: false,
         }
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
         let line = line.into();
-        self.logs.push(line);
-        if !self.logs.is_empty() {
-            self.log_scroll = self.logs.len().saturating_sub(1);
+        // Speed monitor logs every few seconds; keep long sessions from growing forever.
+        if self.logs.len() >= 1000 {
+            self.logs.remove(0);
         }
+        self.logs.push(line);
+        self.log_scroll = self.logs.len().saturating_sub(1);
     }
 
     pub fn reset_connection_metrics(&mut self) {
@@ -196,6 +234,21 @@ impl ConnectionSession {
         self.tx_speed_bps = 0;
         self.rx_total_bytes = 0;
         self.tx_total_bytes = 0;
+    }
+
+    pub fn apply_profile(&mut self, profile: &crate::config::VpnProfile) {
+        self.profile_name = profile.name.clone();
+        self.host = profile.host.clone();
+        self.port = profile.port;
+        self.username = profile.username.clone();
+        self.password = profile.password.clone();
+        self.sudo_password = profile.sudo_password.clone();
+        self.trusted_cert = profile.trusted_cert.clone();
+        self.set_routes = profile.set_routes;
+        self.set_dns = profile.set_dns;
+        self.pppd_use_peerdns = profile.pppd_use_peerdns;
+        self.half_internet_routes = profile.half_internet_routes;
+        self.route_whitelist = profile.route_whitelist.clone();
     }
 }
 
@@ -230,12 +283,20 @@ pub struct App {
     pub profile_sudo_password: String,
     pub profile_save_password: bool,
     pub profile_use_sudo_password: bool,
+    pub profile_set_routes: bool,
+    pub profile_set_dns: bool,
+    pub profile_pppd_use_peerdns: bool,
+    pub profile_half_internet_routes: bool,
+    pub profile_route_whitelist: String,
     pub editing_profile_name: Option<String>,
 
     // Channel
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub event_rx: mpsc::UnboundedReceiver<AppEvent>,
     pub debug_enabled: bool,
+
+    pub network_online: bool,
+    pub click_zones: RefCell<Vec<(Rect, Click)>>,
 
     pub should_quit: bool,
 }
@@ -277,10 +338,17 @@ impl App {
             profile_sudo_password: String::new(),
             profile_save_password: false,
             profile_use_sudo_password: false,
+            profile_set_routes: true,
+            profile_set_dns: true,
+            profile_pppd_use_peerdns: true,
+            profile_half_internet_routes: false,
+            profile_route_whitelist: String::new(),
             editing_profile_name: None,
             event_tx,
             event_rx,
             debug_enabled,
+            network_online: true,
+            click_zones: RefCell::new(Vec::new()),
             should_quit: false,
         }
     }
@@ -334,6 +402,19 @@ impl App {
         ) || self.ui_mode == UiMode::Help
             || self.connection_error.is_some()
             || self.pending_action.is_some()
+    }
+
+    pub fn add_click(&self, area: Rect, click: Click) {
+        self.click_zones.borrow_mut().push((area, click));
+    }
+
+    pub fn click_at(&self, x: u16, y: u16) -> Option<Click> {
+        self.click_zones
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(area, _)| area.contains((x, y).into()))
+            .map(|(_, click)| click.clone())
     }
 
     pub fn request_action_confirmation(&mut self, action: PendingAction) {
@@ -411,6 +492,7 @@ impl App {
     pub fn ensure_session_for_selected_profile(&mut self) -> Option<u64> {
         let profile = self.get_current_profile()?.clone();
         if let Some(idx) = self.find_session_by_profile_name(&profile.name) {
+            self.sessions[idx].apply_profile(&profile);
             self.activate_session(idx);
             return self.sessions.get(idx).map(|s| s.id);
         }
@@ -504,13 +586,12 @@ impl App {
     }
 
     pub fn hide_help(&mut self) {
-        if let Some(prev_mode) = self.previous_ui_mode.take() {
-            self.ui_mode = prev_mode;
-            self.focus = Focus::ProfileList;
-        } else {
-            self.ui_mode = UiMode::ProfileList;
-            self.focus = Focus::ProfileList;
-        }
+        self.ui_mode = self.previous_ui_mode.take().unwrap_or(UiMode::ProfileList);
+        self.focus = match self.ui_mode {
+            UiMode::Connect => Focus::Connect,
+            UiMode::NewProfile | UiMode::EditProfile => Focus::ProfileName,
+            _ => Focus::ProfileList,
+        };
     }
 
     pub fn load_profiles(&mut self, profiles: Vec<crate::config::VpnProfile>) {
@@ -542,6 +623,20 @@ impl App {
         for session in self.sessions.iter_mut() {
             if session.profile_name == profile_name {
                 session.trusted_cert = Some(cert_hash.to_string());
+            }
+        }
+    }
+
+    pub fn sync_profile_into_sessions(
+        &mut self,
+        old_name: Option<&str>,
+        profile: &crate::config::VpnProfile,
+    ) {
+        for session in &mut self.sessions {
+            if session.profile_name == profile.name
+                || old_name == Some(session.profile_name.as_str())
+            {
+                session.apply_profile(profile);
             }
         }
     }
