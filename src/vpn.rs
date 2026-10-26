@@ -231,6 +231,10 @@ struct EffectiveNetworkOptions {
     fallback_legacy_defaults: bool,
 }
 
+// macOS pppd publishes peer DNS as the top resolver scoped to pppN, so every lookup goes
+// through the tunnel; split-tunnel gateways drop that and all public DNS times out.
+const PEERDNS_SUPPORTED: bool = !cfg!(target_os = "macos");
+
 fn resolve_network_options(
     set_routes: bool,
     set_dns: bool,
@@ -245,7 +249,7 @@ fn resolve_network_options(
         return EffectiveNetworkOptions {
             set_routes: true,
             set_dns: true,
-            pppd_use_peerdns: true,
+            pppd_use_peerdns: PEERDNS_SUPPORTED,
             half_internet_routes: false,
             mode_label: "legacy-default",
             fallback_legacy_defaults: true,
@@ -263,7 +267,7 @@ fn resolve_network_options(
     EffectiveNetworkOptions {
         set_routes,
         set_dns,
-        pppd_use_peerdns,
+        pppd_use_peerdns: pppd_use_peerdns && PEERDNS_SUPPORTED,
         half_internet_routes,
         mode_label,
         fallback_legacy_defaults: false,
